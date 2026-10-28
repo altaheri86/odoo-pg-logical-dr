@@ -1,0 +1,8 @@
+# root crontab on the DR server  (sudo crontab -e)
+# Each script logs to /var/log/odoo-dr/, holds a lock so runs never overlap, and exits non-zero on failure.
+
+# files + modules from production, every morning before working hours
+0 6 * * * timeout 12h nice -n 10 ionice -c3 /opt/odoo-dr/scripts/dr-daily-sync.sh > /dev/null 2>&1
+
+# database: hourly replication window (enable, catch up, sync sequences, disable)
+0 * * * * timeout 55m /opt/odoo-dr/scripts/dr-repl-window.sh > /dev/null 2>&1

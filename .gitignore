@@ -1,0 +1,11 @@
+# never commit real configuration or credentials
+*.env
+!*.env.example
+.pgpass
+*.pem
+*.key
+id_*
+# local outputs
+verify-*/
+*.dump
+*.log

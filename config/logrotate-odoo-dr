@@ -1,0 +1,8 @@
+# /etc/logrotate.d/odoo-dr
+/var/log/odoo-dr/*.log {
+    monthly
+    rotate 12
+    compress
+    missingok
+    notifempty
+}
