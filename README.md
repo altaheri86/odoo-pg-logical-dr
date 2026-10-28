@@ -96,6 +96,10 @@ PostgreSQL 17 logical replication · Amazon RDS · Odoo 18 · Ubuntu 24.04 · Ba
 
 Based on a real production project. All company names, hostnames, IP addresses, ports, account IDs and credentials have been replaced with placeholders. Test everything on a copy before touching production.
 
+## Author
+
+**Mohamed Alshaibani**, Senior DevOps Engineer: [github.com/altaheri86](https://github.com/altaheri86)
+
 ## License
 
 [MIT](LICENSE)
