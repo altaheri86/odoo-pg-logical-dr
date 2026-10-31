@@ -1,0 +1,24 @@
+# /etc/systemd/system/dr-pg-tunnel.service
+# SSH tunnel for a PRIVATE publisher (e.g. RDS without public access):
+#   DR 127.0.0.1:15432  ->  SSH to the production app server (already inside the VPC)  ->  <rds-endpoint>:5432
+# Nothing is installed or changed on the app server; it only relays the (still TLS-encrypted) PostgreSQL stream.
+# Everything on DR that talks to the publisher then uses  host=127.0.0.1 port=15432 sslmode=require.
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dr-pg-tunnel
+# Hardening idea: give this key its own line on the app server with  restrict,port-forwarding,permitopen="<rds-endpoint>:5432"
+[Unit]
+Description=SSH tunnel 127.0.0.1:15432 -> private publisher database via the app server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=admin
+ExecStart=/usr/bin/ssh -N -p 22 -i /home/admin/.ssh/id_ed25519 \
+  -o BatchMode=yes -o UserKnownHostsFile=/home/admin/.ssh/known_hosts -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
+  -L 127.0.0.1:15432:<rds-endpoint>.rds.amazonaws.com:5432 \
+  ubuntu@app.example.com
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

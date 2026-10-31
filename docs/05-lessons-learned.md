@@ -14,6 +14,18 @@ The whole setup was first rehearsed against a **duplicate of the production data
 | An interrupted command still created a 21 GB database on the server | Long jobs run with `nohup` and a log; after any interruption, check the server state. |
 | A status check matched itself and reported "running" | `pgrep -f '[n]ame'`. |
 
+## From the production rollout
+
+After the rehearsal, replication was moved to the real production RDS. These came up there:
+
+| What happened | Lesson |
+|---|---|
+| The production RDS had **no public endpoint**; the rehearsal duplicate had one | Check `PubliclyAccessible` while planning. An SSH tunnel through the app server (already inside the VPC) needed **no change** on AWS or the app server. |
+| A module upgrade on production **during the first copy** added 3 columns and stopped the apply worker | Freeze deploys during the first copy. Then make schema sync part of every window, not a manual runbook. |
+| The verify script printed *ALL 0 TABLES IDENTICAL* when the publisher was unreachable | A check that compares nothing must **fail**, not pass. |
+| Windows showed FAILED on working days, only at the sequence step | Verify against **what you copied**, not against a source that keeps moving. |
+| Two servers printed the same view definitions differently (`ARRAY[...]::text[]` casts) | Compare views against a snapshot of the publisher's own definitions, and normalise known print-style differences in full schema diffs. |
+
 ## Design decisions worth repeating
 
 - **Rehearse on a duplicate first.** A database nobody writes to allows an exact, row-by-row comparison — impossible on live.

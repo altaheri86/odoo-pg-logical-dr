@@ -1,9 +1,9 @@
 -- Run on the SUBSCRIBER (DR server) as postgres, after the schema has been restored.
 -- No password in the connection string: libpq reads it from ~postgres/.pgpass
---   <rds-endpoint>:5432:*:dr_replicator:<password>      (file mode 600, owner postgres)
+--   127.0.0.1:15432:*:dr_replicator:<password>      (file mode 600, owner postgres; tunnel, see config/dr-pg-tunnel.service)
 
 CREATE SUBSCRIPTION erp_dr_sub
-  CONNECTION 'host=<rds-endpoint> port=5432 dbname=erp user=dr_replicator sslmode=require connect_timeout=15 application_name=erp_dr_sub keepalives_idle=60'
+  CONNECTION 'host=127.0.0.1 port=15432 dbname=erp user=dr_replicator sslmode=require connect_timeout=15 application_name=erp_dr_sub keepalives_idle=60'
   PUBLICATION erp_dr_pub
   WITH (copy_data = true, create_slot = true, slot_name = 'erp_dr_slot', enabled = true);
 

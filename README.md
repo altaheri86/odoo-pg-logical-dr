@@ -1,12 +1,12 @@
 # Odoo 18 Disaster Recovery with PostgreSQL Logical Replication
 
-**From Amazon RDS (PostgreSQL 17) to an on-premise server — built, rehearsed on a duplicate RDS, and verified row by row.**
+**From a private Amazon RDS (PostgreSQL 17) to an on-premise server: rehearsed on a duplicate RDS, then put live and verified row by row. Schema changes follow automatically.**
 
 ![Architecture](diagrams/diagram-architecture.png)
 
 ## The problem
 
-A company runs its Odoo 18 ERP on AWS: the application on EC2 (ARM / Graviton) and the database on Amazon RDS for PostgreSQL 17 (24 GB). If AWS becomes unavailable, the business must keep working from its own office server:
+A company runs its Odoo 18 ERP on AWS: the application on EC2 (ARM / Graviton) and the database on Amazon RDS for PostgreSQL 17 (25 GB, **no public endpoint**). If AWS becomes unavailable, the business must keep working from its own office server:
 
 | Target | Value |
 |---|---|
@@ -15,6 +15,7 @@ A company runs its Odoo 18 ERP on AWS: the application on EC2 (ARM / Graviton) a
 | Time to be back (RTO) | ≈ 1 hour |
 | Constraint | **No changes on the production app server** — read-only access only |
 | Constraint | Office internet line ≈ 1 MB/s |
+| Constraint | The RDS stays private — no public endpoint, no VPN |
 
 ## Why logical replication
 
@@ -24,24 +25,34 @@ A company runs its Odoo 18 ERP on AWS: the application on EC2 (ARM / Graviton) a
 | `pg_dump` every few hours | Moves the full database every time, long restores, fragile on internet drops, RPO of hours |
 | **Logical replication** ✅ | Only changed rows travel, works across CPU types, resumes after outages from a replication slot |
 
-Logical replication does **not** copy sequences or schema changes — this project closes both gaps (an hourly sequence sync and a module-upgrade procedure).
+Logical replication does **not** copy sequences or schema changes. This project closes both gaps automatically, every hour: a sequence sync, and a catalog-diff **schema sync** that runs before data is allowed to flow.
 
 ![Replication](diagrams/diagram-replication.png)
 
 ## What was built
 
 - **DR server**: Ubuntu 24.04, PostgreSQL 17 subscriber, the Odoo 18 application installed at the same paths as production (services stopped until failover), nginx and certificates.
-- **Database**: `FOR ALL TABLES` publication on RDS → subscription on DR, opened in an **hourly window** by cron (enable → catch up → sync 1,900+ sequences → disable).
+- **Path to a private RDS**: a systemd **SSH tunnel** through the production app server, which is already inside the VPC. Nothing is installed or changed on AWS, and TLS stays end to end.
+- **Database**: `FOR ALL TABLES` publication on RDS → subscription on DR, opened in an **hourly window** by cron: **schema sync → enable → catch up → sync 1,900+ sequences → disable**.
+- **Automatic schema sync**: a `dblink` catalog diff between the publisher and DR. It copies new tables, columns, defaults, NOT NULL, indexes, constraints, sequences and views before each window, and only alerts on risky changes such as type changes or dropped tables. A nightly full `pg_dump -s` diff is the safety net.
 - **Files**: daily `rsync` of Odoo core, enterprise addons and filestore (read-only on production, low priority, bandwidth-limited, resumable) and `git` sync of custom modules pinned to **the commit production actually runs**.
-- **Verification**: a script that compares **every table** on both sides — row count plus an order-independent checksum of every row.
+- **Verification**: a script that compares **every table** on both sides — row count plus an order-independent checksum of every row. It works on a live publisher: it waits for catch-up and re-hashes the busy tables.
+- **Alerts**: every script writes to one `ALERTS.log` and to syslog. A pause flag lets maintenance skip windows safely.
 - **Runbooks**: failover, module upgrades, test copies, rebuild, password and certificate rotation.
 
-## Results (rehearsal on a duplicate RDS)
+## Results
+
+| Check | Rehearsal (duplicate RDS) | Production |
+|---|---|---|
+| Tables replicated | 1,292 / 1,292 | **1,306 / 1,306** |
+| Rows verified identical (count + row hash) | 61.7 million | **62.4 million** |
+| First copy | ~5 h | **4 h 40 min**, through the SSH tunnel, users unaffected |
+| Schema drift test (10 deliberate breakages on DR) | — | **all repaired by the next window in 34 s**; full schema diff identical |
+
+Rehearsal details:
 
 | Check | Result |
 |---|---|
-| Tables replicated | **1,292 / 1,292** |
-| Rows verified identical (count + row hash) | **61.7 million** on both sides |
 | First copy | ~12 GB of table data in ~5 h at ~1 MB/s, 4 tables in parallel |
 | Load on RDS during the first copy | **5–7 % CPU**, memory flat |
 | INSERT / UPDATE / DELETE latency (window open) | ~0.1 s |
@@ -55,7 +66,10 @@ Logical replication does **not** copy sequences or schema changes — this proje
 4. **Dump the schema before creating replication grants**, or the restore fails on a role that only exists on the publisher.
 5. **Sequences are never replicated** — without a sync, Odoo on DR would reuse existing IDs after failover.
 6. **Never write to the replica.** Edits are silently overwritten, inserts cause duplicate keys that stop replication. Test on a `CREATE DATABASE … TEMPLATE` copy instead.
-7. **The replication slot keeps WAL on the publisher** while DR is offline (here ~768 MB/hour because RDS forces a WAL switch every 5 minutes). `max_slot_wal_keep_size` caps it so production disk is safe.
+7. **A module upgrade during the first copy stopped replication** (*missing replicated column*). Schema changes are now synced automatically before every window.
+8. **Verify against what you copied, not against a moving target.** Re-reading a busy publisher to check the sequence copy produced false failures on every working day.
+9. **A check that compares nothing must fail.** The first verify script reported *ALL 0 TABLES IDENTICAL* when the publisher was unreachable.
+10. **The replication slot keeps WAL on the publisher** while DR is offline (here ~768 MB/hour because RDS forces a WAL switch every 5 minutes). `max_slot_wal_keep_size` caps it so production disk is safe.
 
 More in [docs/05-lessons-learned.md](docs/05-lessons-learned.md).
 
@@ -72,12 +86,14 @@ docs/
   06-gaps-and-next-steps.md what a production-grade DR still needs
 scripts/
   dr-repl-window.sh         hourly replication window (cron)
+  dr-schema-sync.sh         copy DDL publisher -> DR before each window (--check)
+  dr-schema-diff.sh         nightly full schema comparison (cron)
   dr-seq-sync.sh            sequence sync, --check, --failover
   dr-daily-sync.sh          files + modules + git (cron)
   dr-repl-status.sh         status at a glance
   dr-verify-data.sh         table-by-table verification
-sql/                        publisher pre-checks, publisher setup, subscriber setup, cheat sheet
-config/                     dr.env.example, PostgreSQL tuning, pg_hba, nginx, logrotate, crontab
+sql/                        publisher pre-checks, publisher setup, subscriber setup, cheat sheet, schema-sync generator
+config/                     dr.env.example, SSH tunnel unit, PostgreSQL tuning, pg_hba, nginx, logrotate, crontab
 diagrams/
 ```
 
@@ -85,12 +101,13 @@ diagrams/
 
 1. Read [docs/01-architecture.md](docs/01-architecture.md), then follow [docs/02-build-guide.md](docs/02-build-guide.md).
 2. Copy `config/dr.env.example` to `/etc/odoo-dr/dr.env` (root, mode 600) and fill in your values.
-3. Install the scripts to `/opt/odoo-dr/scripts/` and the cron lines from `config/crontab.example`.
-4. Passwords live only in `~/.pgpass` files (mode 600) — never in this repo, in scripts or on command lines.
+3. Private RDS: install `config/dr-pg-tunnel.service`, then use `PUB_HOST=127.0.0.1`, `PUB_PORT=15432`.
+4. Install the repo to `/opt/odoo-dr/` (scripts find `sql/` next to them) and the cron lines from `config/crontab.example`.
+5. Passwords live only in `~/.pgpass` files (mode 600) — never in this repo, in scripts or on command lines.
 
 ## Tech
 
-PostgreSQL 17 logical replication · Amazon RDS · Odoo 18 · Ubuntu 24.04 · Bash · rsync · cron · nginx · AWS CLI
+PostgreSQL 17 logical replication · dblink · Amazon RDS · SSH tunnelling · systemd · Odoo 18 · Ubuntu 24.04 · Bash · rsync · cron · nginx · AWS CLI
 
 ## Disclaimer
 

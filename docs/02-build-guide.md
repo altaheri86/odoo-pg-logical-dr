@@ -86,10 +86,31 @@ aws rds modify-db-parameter-group --db-parameter-group-name <param-group> \
   --parameters "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" \
                "ParameterName=max_slot_wal_keep_size,ParameterValue=61440,ApplyMethod=immediate"
 aws rds reboot-db-instance --db-instance-identifier <instance>
-# [DR] what AWS sees as your address — allow THIS on 5432 in the security group
+```
+
+### Reaching the publisher
+
+Check first: `aws rds describe-db-instances --query "DBInstances[0].PubliclyAccessible"`.
+
+**Private RDS (recommended, what production used):** do not make it public. Tunnel through the production app server, which already reaches RDS inside the VPC. Nothing is installed or changed there; it only relays the TLS stream.
+
+```bash
+# [DR] config/dr-pg-tunnel.service -> forwards 127.0.0.1:15432 to <rds-endpoint>:5432 over SSH
+sudo cp config/dr-pg-tunnel.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now dr-pg-tunnel
+timeout 10 bash -c '</dev/tcp/127.0.0.1/15432' && echo open
+# from now on every connection to the publisher: host=127.0.0.1 port=15432 sslmode=require
+```
+
+**Public RDS (the rehearsal duplicate):** allow the DR server's **outgoing** address on 5432 in the security group, and set `PUB_HOST=<rds-endpoint>`, `PUB_PORT=5432`, `TUNNEL_UNIT=` in `dr.env`.
+
+```bash
+# [DR] what AWS sees as your address (can differ from the inbound/NAT address)
 curl -4 https://checkip.amazonaws.com
 timeout 10 bash -c '</dev/tcp/<rds-endpoint>/5432' && echo open
 ```
+
+The rest of this guide uses the tunnel (`127.0.0.1:15432`).
 
 ## Step 6 — Copy the schema
 
@@ -97,7 +118,8 @@ Logical replication carries data, not structure. **Dump before creating the repl
 
 ```bash
 # [DR]
-pg_dump -w -h <rds-endpoint> -U <master> -d erp --schema-only -Fc --no-publications --no-subscriptions -f live.dump
+PGOPTIONS="-c statement_timeout=0" pg_dump -w -h 127.0.0.1 -p 15432 -U <master> -d erp --schema-only -Fc \
+  --no-publications --no-subscriptions --lock-wait-timeout=60s -f live.dump
 pg_restore -l live.dump > live.list
 # drop grants (ACL) and objects DR already has (schema unaccent_schema, extensions)
 grep -v -e '^;' live.list | grep -v -e ' ACL ' \
@@ -113,27 +135,32 @@ grep -v -e '^;' live.list | grep -v -e ' ACL ' \
 Run `sql/02-publisher-setup.sql`. Then put the replication password in **both** `~/.pgpass` of your admin user **and** `~postgres/.pgpass` — the subscription workers run as the OS user `postgres`.
 
 ```
-<rds-endpoint>:5432:*:dr_replicator:<password>
+127.0.0.1:15432:*:dr_replicator:<password>
 ```
 
 ## Step 8 — Subscription (first copy)
 
-Run `sql/03-subscriber-setup.sql` in the evening. Watch with `scripts/dr-repl-status.sh` until every table is `r`.
+Run `sql/03-subscriber-setup.sql` at a quiet time. Watch with `scripts/dr-repl-status.sh` until every table is `r`. In production, ~13 GB of table data took 4 h 40 min at ~1 MB/s through the tunnel; users noticed nothing.
+
+> **Freeze module deploys on production during the first copy.** In production, a module upgrade 2 hours into the copy added 3 columns. The apply worker stopped with *missing replicated column* until the columns were added on DR (17 minutes, no data lost). After step 10 the hourly schema sync handles this by itself.
 
 ## Step 9 — Verify
 
 ```bash
-sudo scripts/dr-verify-data.sh          # RESULT: ALL n TABLES IDENTICAL
-sudo scripts/dr-seq-sync.sh             # copy sequences
-sudo scripts/dr-seq-sync.sh --check     # different=0
+sudo bash scripts/dr-verify-data.sh     # waits for lag 0, re-hashes busy tables -> RESULT: ALL n TABLES IDENTICAL
+sudo scripts/dr-seq-sync.sh             # copy sequences, verified against the copied values
 ```
 
-The exact check needs a publisher without writes (a duplicate restored from a snapshot is ideal); on live, compare at a quiet time.
+Production result: 1,306 of 1,306 tables and 62.4 M rows identical. Pass 1 found 3 busy tables changing while they were hashed; pass 2 after catch-up found 0.
 
 ## Step 10 — Automate
 
 ```bash
+sudo scripts/dr-schema-sync.sh --check  # creates the helper DB (dblink) and the view snapshot -> IN SYNC
 sudo scripts/dr-repl-window.sh          # one manual window -> "window OK"
+sudo scripts/dr-schema-diff.sh          # full schema comparison -> IDENTICAL
 sudo crontab -e                         # add the lines from config/crontab.example
 sudo cp config/logrotate-odoo-dr /etc/logrotate.d/odoo-dr
 ```
+
+The window is now: **schema sync → enable → catch up (all tables ready) → sequences → disable**, every hour.

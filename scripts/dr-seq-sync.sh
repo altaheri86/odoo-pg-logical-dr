@@ -1,12 +1,15 @@
 #!/bin/bash
 # Odoo DR - copy PostgreSQL sequence values publisher -> DR. Logical replication does NOT copy sequences.
 #   (default)  : every sequence on DR = exact publisher state (last_value + is_called). Run after each window.
-#   --check    : compare only
+#                Verified against the snapshot that was applied: the publisher keeps moving while users work,
+#                so re-reading it to verify gives false failures.
+#   --check    : compare with the publisher as it is now (between windows DR is expected to be behind)
 #   --failover : publisher unreachable; every sequence OWNED by a column becomes max(current, max(column))
 #                so new rows can never reuse an id. Unowned sequences keep the last synced value.
 # Config     : /etc/odoo-dr/dr.env (or $DR_ENV)
 set -uo pipefail
 source "${DR_ENV:-/etc/odoo-dr/dr.env}"
+PUB_PORT=${PUB_PORT:-5432}
 LOG=$LOG_DIR/dr-seq-sync.log
 MODE=sync
 for a in "$@"; do case $a in --failover) MODE=failover ;; --check) MODE=check ;; *) echo "unknown option: $a"; exit 2 ;; esac; done
@@ -16,7 +19,7 @@ exec > >(tee -a "$LOG") 2>&1
 log() { echo "$(date '+%F %T') $*"; }
 
 export PGCONNECT_TIMEOUT=15
-PUB=(sudo -u postgres psql -X -w -At -v ON_ERROR_STOP=1 "host=$PUB_HOST port=5432 dbname=$DB_NAME user=$REPL_USER sslmode=require")
+PUB=(sudo -u postgres psql -X -w -At -v ON_ERROR_STOP=1 "host=$PUB_HOST port=$PUB_PORT dbname=$DB_NAME user=$REPL_USER sslmode=require")
 DR=(sudo -u postgres psql -X -At -v ON_ERROR_STOP=1 -d "$DB_NAME")
 # name|last_value|is_called  (pg_sequences.last_value is NULL when never called)
 STATE_SQL="select schemaname||'.'||sequencename||'|'||coalesce(last_value, start_value)||'|'||(last_value is not null)::text from pg_sequences where schemaname='public' order by 1"
@@ -35,11 +38,18 @@ case $MODE in
 check)
   compare; exit $? ;;
 sync)
-  log "===== sequence sync (publisher $PUB_HOST)"
+  log "===== sequence sync (publisher $PUB_HOST:$PUB_PORT)"
   "${PUB[@]}" -c "$STATE_SQL" > "$TMP/pub.txt" || { log "ERROR: cannot read publisher sequences"; exit 1; }
   awk -F'|' '{ printf "SELECT setval(%c%s%c, %s, %s);\n", 39, $1, 39, $2, $3 }' "$TMP/pub.txt" > "$TMP/apply.sql"
   if ! "${DR[@]}" --single-transaction -q -f "$TMP/apply.sql" > /dev/null; then log "ERROR: applying on DR failed (nothing changed)"; exit 1; fi
-  if compare; then log "===== sequence sync OK"; exit 0; else log "===== sequence sync FAILED: still different"; exit 1; fi ;;
+  # verify DR against the snapshot we applied, then report (as info) how much the publisher moved meanwhile
+  "${DR[@]}" -c "$STATE_SQL" > "$TMP/dr.txt"
+  n=$(wc -l < "$TMP/pub.txt"); bad=$(diff "$TMP/pub.txt" "$TMP/dr.txt" | grep -c -e '^<')
+  log "sequences: publisher=$n DR=$(wc -l < "$TMP/dr.txt") different=$bad (vs copied snapshot)"
+  if [ "$bad" -ne 0 ] || [ "$n" -ne "$(wc -l < "$TMP/dr.txt")" ]; then log "===== sequence sync FAILED: DR does not match the copied values"; exit 1; fi
+  moved=$("${PUB[@]}" -c "$STATE_SQL" | diff - "$TMP/pub.txt" | grep -c -e '^<')
+  log "info: $moved sequences advanced on the publisher during the sync (normal while users work)"
+  log "===== sequence sync OK"; exit 0 ;;
 failover)
   log "===== FAILOVER sequence fix (no publisher): owned sequences -> max(current, max(column))"
   "${DR[@]}" -c "select format('SELECT setval(%L, greatest((select last_value from %s), coalesce((select max(%I) from %s), 0), 1), true);',
